@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "670838759342",
+    "project_id": "solar-panel-99b62",
+    "storage_bucket": "solar-panel-99b62.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:670838759342:android:ec31b5bbdc833c19b2323f",
+        "android_client_info": {
+          "package_name": "com.example.untitled2"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCTCopL2gncBVCdXbJ8UtKWi0K25SKviGQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
