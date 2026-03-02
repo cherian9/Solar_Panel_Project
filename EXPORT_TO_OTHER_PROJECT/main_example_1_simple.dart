@@ -1,0 +1,25 @@
+// Example 1: Use SystemControlPage as the main/home page
+
+import 'package:flutter/material.dart';
+import 'pages/system_control_page.dart';
+
+void main() {
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'ESP32 System Control',
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
+        useMaterial3: true,
+      ),
+      home: const SystemControlPage(),
+      debugShowCheckedModeBanner: false,
+    );
+  }
+}

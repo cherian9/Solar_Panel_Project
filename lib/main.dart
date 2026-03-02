@@ -7,6 +7,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'firebase_options.dart';
 import 'login_screen.dart';
 import 'auth_service.dart';
+import 'mongo_service.dart';
 
 // Camera view widget for live panel monitoring with quadrants
 class CameraView extends StatefulWidget {
@@ -25,10 +26,9 @@ class _CameraViewState extends State<CameraView> {
   String? _currentImageUrl;
   String? _displayImageUrl;
 
-  // Multiple camera URLs to try as fallbacks
+  // Camera URL - only actual camera footage, no fallback
   final List<String> cameraUrls = [
     "https://esp32-solarimg.s3.ap-south-1.amazonaws.com/current-panel.jpg",
-    "https://picsum.photos/400/200?random", // Fallback placeholder
   ];
 
   @override
@@ -100,6 +100,8 @@ class _CameraViewState extends State<CameraView> {
                 if (_displayImageUrl != null)
                   Image.network(
                     _displayImageUrl!,
+                    width: double.infinity,
+                    height: double.infinity,
                     fit: BoxFit.cover,
                     key: ValueKey(_displayImageUrl),
                   ),
@@ -109,6 +111,8 @@ class _CameraViewState extends State<CameraView> {
                     opacity: 0.0, // Invisible while loading
                     child: Image.network(
                       _currentImageUrl!,
+                      width: double.infinity,
+                      height: double.infinity,
                       fit: BoxFit.cover,
                       frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
                         if (frame != null) {
@@ -418,12 +422,6 @@ class MyHomePage extends StatefulWidget {
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-  final List<SolarPanel> panels = const [
-    SolarPanel(name: 'Standard Mono', efficiency: 0.18, waterConsumptionLPerDay: 0.5, areaM2: 1.6),
-    SolarPanel(name: 'High Efficiency', efficiency: 0.22, waterConsumptionLPerDay: 0.3, areaM2: 1.7),
-    SolarPanel(name: 'Thin Film', efficiency: 0.12, waterConsumptionLPerDay: 0.2, areaM2: 2.0),
-  ];
-
   double irradiance = 5.0; // kWh/m²/day (typical average)
   int panelCount = 1;
 
@@ -433,8 +431,6 @@ class _MyHomePageState extends State<MyHomePage> {
   // New: index for bottom navigation (0: Status, 1: Energy, 2: Menu)
   int _selectedIndex = 1;
 
-  // New: per-panel cleanliness statuses ("Clean", "Not clean", "Dirty")
-  late List<String> panelStatuses;
 
   // API data for inspection results
   Timer? _apiTimer;
@@ -463,6 +459,15 @@ class _MyHomePageState extends State<MyHomePage> {
   static const double panelHeightCm = 22.0;
   static const double panelAreaM2 = (panelWidthCm * panelHeightCm) / 10000; // Convert cm² to m²
 
+  // Control API for system on/off with MongoDB
+  final MongoService _mongoService = MongoService();
+  bool isSystemOn = false;
+  bool isTogglingSystem = false;
+  bool isPollingESP = false;
+  bool isMongoConnected = false;
+  String controlStatus = "Unknown";
+  int _pollingToken = 0;
+
   // Calculate theoretical max power based on irradiance and area
   double? get theoreticalMaxPower {
     if (solarIrradiance == null) return null;
@@ -481,8 +486,9 @@ class _MyHomePageState extends State<MyHomePage> {
   @override
   void initState() {
     super.initState();
-    // default all panels to Not clean per request
-    panelStatuses = List.filled(panels.length, 'Not clean');
+
+    // Initialize MongoDB and fetch system state
+    _initializeMongoSystem();
 
     // Start fetching API data
     fetchInspectionData();
@@ -490,7 +496,7 @@ class _MyHomePageState extends State<MyHomePage> {
 
     // Start fetching telemetry data
     fetchTelemetryData();
-    _telemetryTimer = Timer.periodic(const Duration(seconds: 3), (_) => fetchTelemetryData());
+    _telemetryTimer = Timer.periodic(const Duration(seconds: 1), (_) => fetchTelemetryData());
 
     // Start fetching weather data (solar irradiance)
     fetchWeatherData();
@@ -502,6 +508,7 @@ class _MyHomePageState extends State<MyHomePage> {
     _apiTimer?.cancel();
     _telemetryTimer?.cancel();
     _weatherTimer?.cancel();
+    _mongoService.close();
     super.dispose();
   }
 
@@ -587,19 +594,300 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
+  // Initialize MongoDB connection and load current state
+  Future<void> _initializeMongoSystem() async {
+    debugPrint('🔄 Initializing MongoDB system...');
+
+    // Connect to MongoDB
+    final connected = await _mongoService.connect();
+    if (!mounted) return;
+
+    setState(() {
+      isMongoConnected = connected;
+      controlStatus = connected ? "Connected" : "Disconnected";
+    });
+
+    if (connected) {
+      // Load current state from database
+      final state = await _mongoService.getSystemState();
+      if (!mounted) return;
+
+      setState(() {
+        isSystemOn = state == 'ON';
+        controlStatus = "Connected";
+      });
+
+      debugPrint('✅ MongoDB system initialized - Status: $state');
+    } else {
+      if (!mounted) return;
+      setState(() {
+        controlStatus = "MongoDB Offline";
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('❌ Failed to connect to MongoDB Atlas'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  // Toggle system ON/OFF using MongoDB
+  Future<void> toggleSystem(bool turnOn) async {
+    if (isTogglingSystem || !isMongoConnected) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Cannot toggle - not connected to database'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
+    final previousState = isSystemOn;
+    final nextState = turnOn;
+    final nextStateStr = turnOn ? 'ON' : 'OFF';
+    final pollId = DateTime.now().millisecondsSinceEpoch;
+
+    // Cancel any existing polling
+    _pollingToken = pollId;
+
+    // 1. Immediately update UI (optimistic update)
+    setState(() {
+      isSystemOn = nextState;
+      isTogglingSystem = true;
+      isPollingESP = true;
+    });
+
+    debugPrint('🔄 Toggle: ${previousState ? "ON" : "OFF"} → $nextStateStr');
+
+    try {
+      // 2. Update MongoDB database
+      final success = await _mongoService.updateSystemState(nextStateStr);
+
+      if (!success) {
+        throw Exception('Failed to update MongoDB');
+      }
+
+      debugPrint('✅ Database updated to: $nextStateStr');
+
+      // 3. Start background polling to ESP32
+      _pollCloudAPI(nextStateStr, pollId);
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('System state updated to $nextStateStr in database'),
+          backgroundColor: Colors.green,
+          duration: Duration(seconds: 2),
+        ),
+      );
+    } catch (err) {
+      debugPrint('❌ Toggle error: $err');
+
+      // Rollback on error
+      if (!mounted) return;
+      setState(() {
+        isSystemOn = previousState;
+        isTogglingSystem = false;
+        isPollingESP = false;
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Toggle failed: $err'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  // Poll ESP32 cloud API for hardware confirmation
+  // Runs in background for up to 80 seconds
+  Future<void> _pollCloudAPI(String desiredState, int pollId) async {
+    const maxAttempts = 80;
+    const cloudControlUrl = 'https://0ezk16r0u1.execute-api.ap-south-1.amazonaws.com/control';
+
+    debugPrint('🔄 [Poll $pollId] Background polling started - Target: $desiredState');
+
+    for (var attempt = 0; attempt < maxAttempts; attempt++) {
+      // Check if polling was cancelled
+      if (_pollingToken != pollId) {
+        debugPrint('❌ [Poll $pollId] Cancelled - New polling started');
+        return;
+      }
+
+      await Future.delayed(const Duration(seconds: 1));
+
+      // Double-check after delay
+      if (_pollingToken != pollId) return;
+
+      try {
+        final response = await http.post(
+          Uri.parse(cloudControlUrl),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'state': desiredState.toLowerCase()}),
+        );
+
+        if (response.statusCode != 200) {
+          debugPrint('📡 [Poll $pollId] [${attempt + 1}s] HTTP ${response.statusCode}');
+          continue;
+        }
+
+        final decoded = jsonDecode(response.body);
+        final espState = decoded is Map<String, dynamic>
+            ? decoded['state']?.toString().toUpperCase()
+            : 'UNKNOWN';
+
+        debugPrint('📡 [Poll $pollId] [${attempt + 1}s] ESP State: $espState | Target: $desiredState');
+
+        // Check if ESP confirmed the state
+        if (espState == desiredState) {
+          debugPrint('✅ [Poll $pollId] SUCCESS at ${attempt + 1}s - ESP confirmed $desiredState');
+
+          if (!mounted || _pollingToken != pollId) return;
+          setState(() {
+            isTogglingSystem = false;
+            isPollingESP = false;
+          });
+
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('✓ ESP32 confirmed $desiredState state'),
+              backgroundColor: Colors.green,
+            ),
+          );
+          return;
+        }
+      } catch (err) {
+        debugPrint('❌ [Poll $pollId] [${attempt + 1}s] Cloud API error: $err');
+      }
+    }
+
+    // Timeout after 80 seconds
+    debugPrint('⚠️ [Poll $pollId] Timeout after 80 seconds');
+
+    if (!mounted || _pollingToken != pollId) return;
+    setState(() {
+      isTogglingSystem = false;
+      isPollingESP = false;
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('⚠ ESP32 did not confirm within 80 seconds'),
+        backgroundColor: Colors.orange,
+        duration: Duration(seconds: 4),
+      ),
+    );
+  }
+
   // New: build different body content per tab
   Widget _buildBody() {
     switch (_selectedIndex) {
       case 0: // Status
-        // compute counts for summary
-        final cleanCount = panelStatuses.where((s) => s == 'Clean').length;
-        final notCleanCount = panelStatuses.where((s) => s == 'Not clean').length;
-        final dirtyCount = panelStatuses.where((s) => s == 'Dirty').length;
 
         return SingleChildScrollView(
           padding: const EdgeInsets.all(12.0),
           child: Column(
             children: [
+              // System Control Card
+              Card(
+                elevation: 4,
+                color: isSystemOn ? Colors.green[50] : Colors.grey[100],
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Icon(
+                                    isSystemOn ? Icons.power_settings_new : Icons.power_off,
+                                    color: isSystemOn ? Colors.green[700] : Colors.grey[600],
+                                    size: 28,
+                                  ),
+                                  SizedBox(width: 12),
+                                  Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        'System Status',
+                                        style: TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                      SizedBox(height: 4),
+                                      Row(
+                                        children: [
+                                          Container(
+                                            width: 8,
+                                            height: 8,
+                                            decoration: BoxDecoration(
+                                              color: isSystemOn ? Colors.green : Colors.grey,
+                                              shape: BoxShape.circle,
+                                            ),
+                                          ),
+                                          SizedBox(width: 6),
+                                          Text(
+                                            isSystemOn ? 'ONLINE' : 'OFFLINE',
+                                            style: TextStyle(
+                                              fontSize: 13,
+                                              fontWeight: FontWeight.bold,
+                                              color: isSystemOn ? Colors.green[700] : Colors.grey[600],
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                          // Toggle Switch
+                          Transform.scale(
+                            scale: 1.2,
+                            child: Switch(
+                              value: isSystemOn,
+                              onChanged: isTogglingSystem ? null : (value) {
+                                toggleSystem(value);
+                              },
+                              activeThumbColor: Colors.green[700],
+                              inactiveThumbColor: Colors.grey[600],
+                            ),
+                          ),
+                        ],
+                      ),
+                      if (isTogglingSystem || isPollingESP) ...[
+                        SizedBox(height: 12),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                            SizedBox(width: 8),
+                            Text(
+                              isPollingESP ? 'Syncing with ESP32...' : 'Updating database...',
+                              style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
               // Live camera view
               Card(
                 child: Padding(
@@ -886,21 +1174,6 @@ class _MyHomePageState extends State<MyHomePage> {
                             ],
                           ),
                         ),
-                        const SizedBox(height: 12),
-                        // Show full JSON data
-                        ExpansionTile(
-                          title: Text('Full Data', style: TextStyle(fontSize: 14)),
-                          children: [
-                            Container(
-                              padding: const EdgeInsets.all(8),
-                              width: double.infinity,
-                              child: Text(
-                                jsonEncode(inspectionData),
-                                style: TextStyle(fontSize: 11, fontFamily: 'monospace'),
-                              ),
-                            ),
-                          ],
-                        ),
                       ] else ...[
                         Center(
                           child: Padding(
@@ -1021,74 +1294,6 @@ class _MyHomePageState extends State<MyHomePage> {
                       ],
                     ],
                   ),
-                ),
-              ),
-              const SizedBox(height: 12),
-              // Cleanliness summary card
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceAround,
-                    children: [
-                      Column(
-                        children: [
-                          Text('Clean', style: Theme.of(context).textTheme.bodyLarge),
-                          const SizedBox(height: 6),
-                          Chip(label: Text('$cleanCount')),
-                        ],
-                      ),
-                      Column(
-                        children: [
-                          Text('Not clean', style: Theme.of(context).textTheme.bodyLarge),
-                          const SizedBox(height: 6),
-                          Chip(label: Text('$notCleanCount')),
-                        ],
-                      ),
-                      Column(
-                        children: [
-                          Text('Dirty', style: Theme.of(context).textTheme.bodyLarge),
-                          const SizedBox(height: 6),
-                          Chip(label: Text('$dirtyCount')),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              const SizedBox(height: 12),
-              // per-panel list with status dropdowns
-              SizedBox(
-                height: 300,
-                child: ListView.builder(
-                  shrinkWrap: true,
-                  itemCount: panels.length,
-                  itemBuilder: (context, index) {
-                    final p = panels[index];
-                    final status = panelStatuses[index];
-                    return Card(
-                      margin: const EdgeInsets.symmetric(vertical: 6),
-                      child: ListTile(
-                        leading: const Icon(Icons.solar_power),
-                        title: Text(p.name),
-                        subtitle: Text('Efficiency: ${(p.efficiency * 100).toStringAsFixed(1)}%'),
-                        trailing: DropdownButton<String>(
-                          value: status,
-                          items: const [
-                            DropdownMenuItem(value: 'Clean', child: Text('Clean')),
-                            DropdownMenuItem(value: 'Not clean', child: Text('Not clean')),
-                            DropdownMenuItem(value: 'Dirty', child: Text('Dirty')),
-                          ],
-                          onChanged: (v) {
-                            if (v == null) return;
-                            setState(() {
-                              panelStatuses[index] = v;
-                            });
-                          },
-                        ),
-                      ),
-                    );
-                  },
                 ),
               ),
             ],
@@ -1231,8 +1436,107 @@ class _MyHomePageState extends State<MyHomePage> {
           padding: const EdgeInsets.all(12.0),
           child: Column(
             children: [
-              // Telemetry Data Card
+              // System Control Card
               Card(
+                elevation: 4,
+                color: isSystemOn ? Colors.green[50] : Colors.grey[100],
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Icon(
+                                    isSystemOn ? Icons.power_settings_new : Icons.power_off,
+                                    color: isSystemOn ? Colors.green[700] : Colors.grey[600],
+                                    size: 28,
+                                  ),
+                                  SizedBox(width: 12),
+                                  Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        'System Status',
+                                        style: TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                      SizedBox(height: 4),
+                                      Row(
+                                        children: [
+                                          Container(
+                                            width: 8,
+                                            height: 8,
+                                            decoration: BoxDecoration(
+                                              color: isSystemOn ? Colors.green : Colors.grey,
+                                              shape: BoxShape.circle,
+                                            ),
+                                          ),
+                                          SizedBox(width: 6),
+                                          Text(
+                                            isSystemOn ? 'ONLINE' : 'OFFLINE',
+                                            style: TextStyle(
+                                              fontSize: 13,
+                                              fontWeight: FontWeight.bold,
+                                              color: isSystemOn ? Colors.green[700] : Colors.grey[600],
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                          // Toggle Switch
+                          Transform.scale(
+                            scale: 1.2,
+                            child: Switch(
+                              value: isSystemOn,
+                              onChanged: isTogglingSystem ? null : (value) {
+                                toggleSystem(value);
+                              },
+                              activeThumbColor: Colors.green[700],
+                              inactiveThumbColor: Colors.grey[600],
+                            ),
+                          ),
+                        ],
+                      ),
+                      if (isTogglingSystem || isPollingESP) ...[
+                        SizedBox(height: 12),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                            SizedBox(width: 8),
+                            Text(
+                              isPollingESP ? 'Syncing with ESP32...' : 'Updating database...',
+                              style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              // Show content only when system is ON
+              if (isSystemOn) ...[
+                // Telemetry Data Card
+                Card(
                 child: Padding(
                   padding: const EdgeInsets.all(16),
                   child: Column(
@@ -1241,7 +1545,7 @@ class _MyHomePageState extends State<MyHomePage> {
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          Text('Live Telemetry', style: Theme.of(context).textTheme.titleMedium),
+                          Text('Panel Readings', style: Theme.of(context).textTheme.titleMedium),
                           Row(
                             children: [
                               Container(
@@ -1407,7 +1711,7 @@ class _MyHomePageState extends State<MyHomePage> {
                         children: [
                           Icon(Icons.analytics_outlined, size: 20, color: Colors.purple[700]),
                           SizedBox(width: 8),
-                          Text('Panel Efficiency Analysis', style: Theme.of(context).textTheme.titleMedium),
+                          Text('Efficiency Analysis', style: Theme.of(context).textTheme.titleMedium),
                         ],
                       ),
                       const SizedBox(height: 12),
@@ -1684,24 +1988,42 @@ class _MyHomePageState extends State<MyHomePage> {
                   ),
                 ),
               ),
-              const SizedBox(height: 12),
-              // Panel cards list
-              ListView.builder(
-                shrinkWrap: true,
-                physics: NeverScrollableScrollPhysics(),
-                itemCount: panels.length,
-                itemBuilder: (context, index) {
-                  final panel = panels[index];
-                  final dailyPerPanel = panel.estimatedDailyKWh(irradiance);
-                  final totalDaily = dailyPerPanel * panelCount;
-                  return PanelFeatureCard(
-                    panel: panel,
-                    dailyPerPanelKWh: dailyPerPanel,
-                    totalDailyKWh: totalDaily,
-                    panelCount: panelCount,
-                  );
-                },
-              ),
+              ] else ...[
+                // Show message when system is OFF
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(40.0),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(
+                          Icons.power_off,
+                          size: 64,
+                          color: Colors.grey[400],
+                        ),
+                        SizedBox(height: 16),
+                        Text(
+                          'System is Offline',
+                          style: TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.grey[700],
+                          ),
+                        ),
+                        SizedBox(height: 8),
+                        Text(
+                          'Turn on the system to view energy data',
+                          style: TextStyle(
+                            fontSize: 14,
+                            color: Colors.grey[600],
+                          ),
+                          textAlign: TextAlign.center,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
             ],
           ),
         );
@@ -1711,22 +2033,185 @@ class _MyHomePageState extends State<MyHomePage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: const Color(0xFFF5F7FA),
       appBar: AppBar(
-        title: Text(widget.title),
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        toolbarHeight: 80,
+        backgroundColor: const Color(0xFF0277BD),
+        elevation: 0,
+        flexibleSpace: Container(
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              colors: [Color(0xFF0277BD), Color(0xFF01579B)],
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+            ),
+          ),
+        ),
+        title: Row(
+          children: [
+            // Solar Panel Icon
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                  color: Colors.white.withValues(alpha: 0.3),
+                  width: 1.5,
+                ),
+              ),
+              child: const Icon(
+                Icons.solar_power,
+                color: Color(0xFFFFC107),
+                size: 32,
+              ),
+            ),
+            const SizedBox(width: 14),
+            // Title and Subtitle
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Text(
+                    'Solar Monitor',
+                    style: TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white,
+                      letterSpacing: 0.5,
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    _getPageSubtitle(),
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Colors.white.withValues(alpha: 0.85),
+                      fontWeight: FontWeight.w400,
+                      letterSpacing: 0.3,
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          // MongoDB Connection Status Badge
+          Container(
+            margin: const EdgeInsets.only(right: 4),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: isMongoConnected
+                ? const Color(0xFF4CAF50).withValues(alpha: 0.2)
+                : const Color(0xFFF44336).withValues(alpha: 0.2),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(
+                color: isMongoConnected
+                  ? const Color(0xFF4CAF50)
+                  : const Color(0xFFF44336),
+                width: 1.5,
+              ),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 7,
+                  height: 7,
+                  decoration: BoxDecoration(
+                    color: isMongoConnected
+                      ? const Color(0xFF4CAF50)
+                      : const Color(0xFFF44336),
+                    shape: BoxShape.circle,
+                    boxShadow: isMongoConnected ? [
+                      BoxShadow(
+                        color: const Color(0xFF4CAF50).withValues(alpha: 0.6),
+                        blurRadius: 4,
+                        spreadRadius: 1,
+                      ),
+                    ] : null,
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  isMongoConnected ? 'Online' : 'Offline',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: isMongoConnected
+                      ? const Color(0xFF4CAF50)
+                      : const Color(0xFFF44336),
+                    fontWeight: FontWeight.w600,
+                  ),
+                  overflow: TextOverflow.clip,
+                  maxLines: 1,
+                ),
+              ],
+            ),
+          ),
+          // Logout Button
+          IconButton(
+            icon: const Icon(Icons.logout_rounded, color: Colors.white, size: 22),
+            onPressed: () async {
+              await AuthService().signOut();
+            },
+            tooltip: 'Sign Out',
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+          ),
+        ],
       ),
-      // Use the body builder so content changes with bottom nav
       body: _buildBody(),
-      // New: bottom navigation bar with Status / Energy / Menu
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: _selectedIndex,
         onTap: _onItemTapped,
+        backgroundColor: Colors.white,
+        selectedItemColor: const Color(0xFF0277BD),
+        unselectedItemColor: Colors.grey[600],
+        type: BottomNavigationBarType.fixed,
+        elevation: 8,
+        selectedLabelStyle: const TextStyle(
+          fontWeight: FontWeight.w600,
+          fontSize: 12,
+        ),
+        unselectedLabelStyle: const TextStyle(
+          fontSize: 11,
+        ),
         items: const [
-          BottomNavigationBarItem(icon: Icon(Icons.assignment_turned_in), label: 'Status'),
-          BottomNavigationBarItem(icon: Icon(Icons.bolt), label: 'Energy'),
-          BottomNavigationBarItem(icon: Icon(Icons.menu), label: 'Menu'),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.dashboard_outlined),
+            activeIcon: Icon(Icons.dashboard),
+            label: 'Status',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.bolt_outlined),
+            activeIcon: Icon(Icons.bolt),
+            label: 'Energy',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.settings_outlined),
+            activeIcon: Icon(Icons.settings),
+            label: 'Settings',
+          ),
         ],
       ),
     );
+  }
+
+  String _getPageSubtitle() {
+    switch (_selectedIndex) {
+      case 0:
+        return 'System Overview & Live Monitoring';
+      case 1:
+        return 'Performance & Energy Analytics';
+      case 2:
+        return 'Configuration & Management';
+      default:
+        return 'Solar Panel Management System';
+    }
   }
 }
