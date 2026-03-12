@@ -161,29 +161,29 @@ class _CameraViewState extends State<CameraView> {
                 painter: QuadrantPainter(),
                 child: Stack(
                   children: [
-                    // Left Upper (LU)
+                    // Left Upper (LU) - swapped with RD
                     Positioned(
                       top: 8,
                       left: 8,
-                      child: _buildQuadrantLabel('LU', widget.inspectionData?['lu']),
+                      child: _buildQuadrantLabel('LU', widget.inspectionData?['rd']),
                     ),
-                    // Right Upper (RU)
+                    // Right Upper (RU) - swapped with LD
                     Positioned(
                       top: 8,
                       right: 48,
-                      child: _buildQuadrantLabel('RU', widget.inspectionData?['ru']),
+                      child: _buildQuadrantLabel('RU', widget.inspectionData?['ld']),
                     ),
-                    // Left Down (LD)
+                    // Left Down (LD) - swapped with RU
                     Positioned(
                       bottom: 8,
                       left: 8,
-                      child: _buildQuadrantLabel('LD', widget.inspectionData?['ld']),
+                      child: _buildQuadrantLabel('LD', widget.inspectionData?['ru']),
                     ),
-                    // Right Down (RD)
+                    // Right Down (RD) - swapped with LU
                     Positioned(
                       bottom: 8,
                       right: 48,
-                      child: _buildQuadrantLabel('RD', widget.inspectionData?['rd']),
+                      child: _buildQuadrantLabel('RD', widget.inspectionData?['lu']),
                     ),
                   ],
                 ),
@@ -468,6 +468,18 @@ class _MyHomePageState extends State<MyHomePage> {
   String controlStatus = "Unknown";
   int _pollingToken = 0;
 
+  // Mist control state
+  bool isMistOn = false;
+  bool isTogglingMist = false;
+  String mistStatus = "Unknown";
+
+  // Mist control advanced settings
+  TimeOfDay mistTimerOn = TimeOfDay(hour: 8, minute: 0);
+  TimeOfDay mistTimerOff = TimeOfDay(hour: 18, minute: 0);
+  bool mistTimerEnabled = true;
+  double mistTempThreshold = 32.0;
+  bool isUpdatingMistSettings = false;
+
   // Calculate theoretical max power based on irradiance and area
   double? get theoreticalMaxPower {
     if (solarIrradiance == null) return null;
@@ -658,6 +670,11 @@ class _MyHomePageState extends State<MyHomePage> {
       isSystemOn = nextState;
       isTogglingSystem = true;
       isPollingESP = true;
+
+      // Automatically navigate to Energy page when system turns ON
+      if (!previousState && nextState) {
+        _selectedIndex = 1; // Switch to Energy page (index 1)
+      }
     });
 
     debugPrint('🔄 Toggle: ${previousState ? "ON" : "OFF"} → $nextStateStr');
@@ -703,9 +720,9 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   // Poll ESP32 cloud API for hardware confirmation
-  // Runs in background for up to 80 seconds
+  // Runs in background for up to 30 seconds
   Future<void> _pollCloudAPI(String desiredState, int pollId) async {
-    const maxAttempts = 80;
+    const maxAttempts = 30;
     const cloudControlUrl = 'https://0ezk16r0u1.execute-api.ap-south-1.amazonaws.com/control';
 
     debugPrint('🔄 [Poll $pollId] Background polling started - Target: $desiredState');
@@ -734,15 +751,25 @@ class _MyHomePageState extends State<MyHomePage> {
           continue;
         }
 
+        // Debug: print full response body
+        debugPrint('📡 [Poll $pollId] [${attempt + 1}s] Response body: ${response.body}');
+
         final decoded = jsonDecode(response.body);
-        final espState = decoded is Map<String, dynamic>
-            ? decoded['state']?.toString().toUpperCase()
-            : 'UNKNOWN';
+
+        // Try multiple possible response formats
+        String? espState;
+        if (decoded is Map<String, dynamic>) {
+          // Try different possible keys
+          espState = decoded['state']?.toString().toUpperCase() ??
+                    decoded['current_state']?.toString().toUpperCase() ??
+                    decoded['system_state']?.toString().toUpperCase() ??
+                    decoded['status']?.toString().toUpperCase();
+        }
 
         debugPrint('📡 [Poll $pollId] [${attempt + 1}s] ESP State: $espState | Target: $desiredState');
 
         // Check if ESP confirmed the state
-        if (espState == desiredState) {
+        if (espState != null && espState == desiredState) {
           debugPrint('✅ [Poll $pollId] SUCCESS at ${attempt + 1}s - ESP confirmed $desiredState');
 
           if (!mounted || _pollingToken != pollId) return;
@@ -764,8 +791,8 @@ class _MyHomePageState extends State<MyHomePage> {
       }
     }
 
-    // Timeout after 80 seconds
-    debugPrint('⚠️ [Poll $pollId] Timeout after 80 seconds');
+    // Timeout after 30 seconds
+    debugPrint('⚠️ [Poll $pollId] Timeout after 30 seconds');
 
     if (!mounted || _pollingToken != pollId) return;
     setState(() {
@@ -775,11 +802,126 @@ class _MyHomePageState extends State<MyHomePage> {
 
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text('⚠ ESP32 did not confirm within 80 seconds'),
+        content: Text('⚠ ESP32 did not confirm within 30 seconds'),
         backgroundColor: Colors.orange,
         duration: Duration(seconds: 4),
       ),
     );
+  }
+
+  // Toggle mist system ON/OFF
+  Future<void> toggleMist(bool turnOn) async {
+    if (isTogglingMist) return;
+
+    setState(() {
+      isTogglingMist = true;
+    });
+
+    final mistState = turnOn ? 'on' : 'off';
+    debugPrint('🌫️ Toggling mist: ${isMistOn ? "ON" : "OFF"} → ${turnOn ? "ON" : "OFF"}');
+
+    try {
+      final response = await http.post(
+        Uri.parse('https://czqc08r3n3.execute-api.ap-south-1.amazonaws.com/default/MistControl'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'mist': mistState}),
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        debugPrint('✅ Mist control response: $data');
+
+        if (!mounted) return;
+        setState(() {
+          isMistOn = turnOn;
+          mistStatus = 'Connected';
+          isTogglingMist = false;
+        });
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('✓ Mist system turned ${turnOn ? "ON" : "OFF"}'),
+            backgroundColor: Colors.green,
+            duration: Duration(seconds: 2),
+          ),
+        );
+      } else {
+        throw Exception('HTTP ${response.statusCode}');
+      }
+    } catch (err) {
+      debugPrint('❌ Mist toggle error: $err');
+
+      if (!mounted) return;
+      setState(() {
+        isTogglingMist = false;
+        mistStatus = 'Error';
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to toggle mist: $err'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  Future<void> updateMistSettings() async {
+    if (isUpdatingMistSettings) return;
+
+    setState(() {
+      isUpdatingMistSettings = true;
+    });
+
+    debugPrint('⚙️ Updating mist settings...');
+
+    try {
+      final response = await http.post(
+        Uri.parse('https://czqc08r3n3.execute-api.ap-south-1.amazonaws.com/default/MistControl'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'mist': isMistOn ? 'on' : 'off',
+          'timerOn': '${mistTimerOn.hour.toString().padLeft(2, '0')}:${mistTimerOn.minute.toString().padLeft(2, '0')}',
+          'timerOff': '${mistTimerOff.hour.toString().padLeft(2, '0')}:${mistTimerOff.minute.toString().padLeft(2, '0')}',
+          'timerEnabled': mistTimerEnabled,
+          'tempThreshold': mistTempThreshold,
+        }),
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        debugPrint('✅ Mist settings updated: $data');
+
+        if (!mounted) return;
+        setState(() {
+          isUpdatingMistSettings = false;
+        });
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('✓ Mist settings updated successfully'),
+            backgroundColor: Colors.green,
+            duration: Duration(seconds: 2),
+          ),
+        );
+      } else {
+        throw Exception('HTTP ${response.statusCode}');
+      }
+    } catch (err) {
+      debugPrint('❌ Mist settings update error: $err');
+
+      if (!mounted) return;
+      setState(() {
+        isUpdatingMistSettings = false;
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to update mist settings: $err'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
   }
 
   // New: build different body content per tab
@@ -953,7 +1095,13 @@ class _MyHomePageState extends State<MyHomePage> {
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          Text('Inspection Results', style: Theme.of(context).textTheme.titleMedium),
+                          Expanded(
+                            child: Text(
+                              'Inspection Results',
+                              style: Theme.of(context).textTheme.titleMedium,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
                           Row(
                             children: [
                               Container(
@@ -1021,7 +1169,7 @@ class _MyHomePageState extends State<MyHomePage> {
                                     // Top row (LU, RU)
                                     Row(
                                       children: [
-                                        // Left Upper quadrant
+                                        // Left Upper quadrant - swapped with RD
                                         Expanded(
                                           child: Container(
                                             padding: const EdgeInsets.all(20),
@@ -1045,7 +1193,7 @@ class _MyHomePageState extends State<MyHomePage> {
                                                 ),
                                                 const SizedBox(height: 6),
                                                 Text(
-                                                  '${inspectionData!['lu'] ?? 'N/A'}',
+                                                  '${inspectionData!['rd'] ?? 'N/A'}',
                                                   style: TextStyle(
                                                     color: Colors.white,
                                                     fontSize: 20,
@@ -1056,7 +1204,7 @@ class _MyHomePageState extends State<MyHomePage> {
                                             ),
                                           ),
                                         ),
-                                        // Right Upper quadrant
+                                        // Right Upper quadrant - swapped with LD
                                         Expanded(
                                           child: Container(
                                             padding: const EdgeInsets.all(20),
@@ -1080,7 +1228,7 @@ class _MyHomePageState extends State<MyHomePage> {
                                                 ),
                                                 const SizedBox(height: 6),
                                                 Text(
-                                                  '${inspectionData!['ru'] ?? 'N/A'}',
+                                                  '${inspectionData!['ld'] ?? 'N/A'}',
                                                   style: TextStyle(
                                                     color: Colors.white,
                                                     fontSize: 20,
@@ -1096,7 +1244,7 @@ class _MyHomePageState extends State<MyHomePage> {
                                     // Bottom row (LD, RD)
                                     Row(
                                       children: [
-                                        // Left Down quadrant
+                                        // Left Down quadrant - swapped with RU
                                         Expanded(
                                           child: Container(
                                             padding: const EdgeInsets.all(20),
@@ -1120,7 +1268,7 @@ class _MyHomePageState extends State<MyHomePage> {
                                                 ),
                                                 const SizedBox(height: 6),
                                                 Text(
-                                                  '${inspectionData!['ld'] ?? 'N/A'}',
+                                                  '${inspectionData!['ru'] ?? 'N/A'}',
                                                   style: TextStyle(
                                                     color: Colors.white,
                                                     fontSize: 20,
@@ -1131,7 +1279,7 @@ class _MyHomePageState extends State<MyHomePage> {
                                             ),
                                           ),
                                         ),
-                                        // Right Down quadrant
+                                        // Right Down quadrant - swapped with LU
                                         Expanded(
                                           child: Container(
                                             padding: const EdgeInsets.all(20),
@@ -1155,7 +1303,7 @@ class _MyHomePageState extends State<MyHomePage> {
                                                 ),
                                                 const SizedBox(height: 6),
                                                 Text(
-                                                  '${inspectionData!['rd'] ?? 'N/A'}',
+                                                  '${inspectionData!['lu'] ?? 'N/A'}',
                                                   style: TextStyle(
                                                     color: Colors.white,
                                                     fontSize: 20,
@@ -1566,6 +1714,7 @@ class _MyHomePageState extends State<MyHomePage> {
                       if (telemetryData != null) ...[
                         Row(
                           children: [
+                            // Voltage card
                             Expanded(
                               child: Card(
                                 color: Colors.amber[50],
@@ -1984,6 +2133,350 @@ class _MyHomePageState extends State<MyHomePage> {
                           ),
                         ),
                       ],
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              // Mist Control Card
+              Card(
+                elevation: 4,
+                color: isMistOn ? Colors.blue[50] : Colors.grey[100],
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Icon(
+                                    Icons.water_drop,
+                                    color: isMistOn ? Colors.blue[700] : Colors.grey[600],
+                                    size: 28,
+                                  ),
+                                  SizedBox(width: 12),
+                                  Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        'Mist Control',
+                                        style: TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                      SizedBox(height: 4),
+                                      Row(
+                                        children: [
+                                          Container(
+                                            width: 8,
+                                            height: 8,
+                                            decoration: BoxDecoration(
+                                              color: isMistOn ? Colors.blue : Colors.grey,
+                                              shape: BoxShape.circle,
+                                            ),
+                                          ),
+                                          SizedBox(width: 6),
+                                          Text(
+                                            isMistOn ? 'ACTIVE' : 'INACTIVE',
+                                            style: TextStyle(
+                                              fontSize: 13,
+                                              fontWeight: FontWeight.bold,
+                                              color: isMistOn ? Colors.blue[700] : Colors.grey[600],
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                          // Toggle Switch
+                          Transform.scale(
+                            scale: 1.2,
+                            child: Switch(
+                              value: isMistOn,
+                              onChanged: isTogglingMist ? null : (value) {
+                                toggleMist(value);
+                              },
+                              activeThumbColor: Colors.blue[700],
+                              inactiveThumbColor: Colors.grey[600],
+                            ),
+                          ),
+                        ],
+                      ),
+                      if (isTogglingMist) ...[
+                        SizedBox(height: 12),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                            SizedBox(width: 8),
+                            Text(
+                              'Updating mist system...',
+                              style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                            ),
+                          ],
+                        ),
+                      ],
+                      SizedBox(height: 12),
+                      Container(
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: Colors.blue[50],
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(color: Colors.blue[200]!, width: 1),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(Icons.info_outline, size: 14, color: Colors.blue[700]),
+                            SizedBox(width: 6),
+                            Expanded(
+                              child: Text(
+                                'Controls the misting system for panel cooling and cleaning',
+                                style: TextStyle(fontSize: 11, color: Colors.grey[700]),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      // Advanced Settings
+                      SizedBox(height: 16),
+                      Divider(),
+                      SizedBox(height: 8),
+                      Text(
+                        'Schedule & Settings',
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.grey[800],
+                        ),
+                      ),
+                      SizedBox(height: 12),
+                      // Timer Enable Toggle
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(Icons.schedule, size: 18, color: Colors.blue[700]),
+                              SizedBox(width: 8),
+                              Text(
+                                'Enable Timer',
+                                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500),
+                              ),
+                            ],
+                          ),
+                          Switch(
+                            value: mistTimerEnabled,
+                            onChanged: (value) {
+                              setState(() {
+                                mistTimerEnabled = value;
+                              });
+                            },
+                            activeThumbColor: Colors.blue[700],
+                          ),
+                        ],
+                      ),
+                      // Timer On
+                      SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: InkWell(
+                              onTap: () async {
+                                final TimeOfDay? picked = await showTimePicker(
+                                  context: context,
+                                  initialTime: mistTimerOn,
+                                );
+                                if (picked != null) {
+                                  setState(() {
+                                    mistTimerOn = picked;
+                                  });
+                                }
+                              },
+                              child: Container(
+                                padding: EdgeInsets.all(10),
+                                decoration: BoxDecoration(
+                                  color: Colors.grey[100],
+                                  borderRadius: BorderRadius.circular(8),
+                                  border: Border.all(color: Colors.grey[300]!),
+                                ),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Row(
+                                      children: [
+                                        Icon(Icons.wb_sunny, size: 14, color: Colors.orange[700]),
+                                        SizedBox(width: 4),
+                                        Flexible(
+                                          child: Text(
+                                            'Start',
+                                            style: TextStyle(fontSize: 11, color: Colors.grey[600]),
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    SizedBox(height: 4),
+                                    Text(
+                                      '${mistTimerOn.hour.toString().padLeft(2, '0')}:${mistTimerOn.minute.toString().padLeft(2, '0')}',
+                                      style: TextStyle(
+                                        fontSize: 16,
+                                        fontWeight: FontWeight.bold,
+                                        color: Colors.blue[700],
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                          SizedBox(width: 8),
+                          Expanded(
+                            child: InkWell(
+                              onTap: () async {
+                                final TimeOfDay? picked = await showTimePicker(
+                                  context: context,
+                                  initialTime: mistTimerOff,
+                                );
+                                if (picked != null) {
+                                  setState(() {
+                                    mistTimerOff = picked;
+                                  });
+                                }
+                              },
+                              child: Container(
+                                padding: EdgeInsets.all(10),
+                                decoration: BoxDecoration(
+                                  color: Colors.grey[100],
+                                  borderRadius: BorderRadius.circular(8),
+                                  border: Border.all(color: Colors.grey[300]!),
+                                ),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Row(
+                                      children: [
+                                        Icon(Icons.nightlight, size: 14, color: Colors.indigo[700]),
+                                        SizedBox(width: 4),
+                                        Flexible(
+                                          child: Text(
+                                            'End',
+                                            style: TextStyle(fontSize: 11, color: Colors.grey[600]),
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    SizedBox(height: 4),
+                                    Text(
+                                      '${mistTimerOff.hour.toString().padLeft(2, '0')}:${mistTimerOff.minute.toString().padLeft(2, '0')}',
+                                      style: TextStyle(
+                                        fontSize: 16,
+                                        fontWeight: FontWeight.bold,
+                                        color: Colors.blue[700],
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      // Temperature Threshold
+                      SizedBox(height: 12),
+                      Container(
+                        padding: EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Colors.red[50],
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.red[200]!),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Row(
+                                  children: [
+                                    Icon(Icons.thermostat, size: 18, color: Colors.red[700]),
+                                    SizedBox(width: 8),
+                                    Text(
+                                      'Temperature Threshold',
+                                      style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500),
+                                    ),
+                                  ],
+                                ),
+                                Text(
+                                  '${mistTempThreshold.toStringAsFixed(1)}°C',
+                                  style: TextStyle(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.red[700],
+                                  ),
+                                ),
+                              ],
+                            ),
+                            SizedBox(height: 8),
+                            Slider(
+                              value: mistTempThreshold,
+                              min: 20.0,
+                              max: 50.0,
+                              divisions: 30,
+                              activeColor: Colors.red[600],
+                              inactiveColor: Colors.red[200],
+                              onChanged: (value) {
+                                setState(() {
+                                  mistTempThreshold = value;
+                                });
+                              },
+                            ),
+                            Text(
+                              'Mist activates automatically when panel exceeds this temperature',
+                              style: TextStyle(fontSize: 10, color: Colors.grey[600]),
+                            ),
+                          ],
+                        ),
+                      ),
+                      // Apply Settings Button
+                      SizedBox(height: 12),
+                      SizedBox(
+                        width: double.infinity,
+                        child: ElevatedButton.icon(
+                          onPressed: isUpdatingMistSettings ? null : updateMistSettings,
+                          icon: isUpdatingMistSettings
+                              ? SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                                )
+                              : Icon(Icons.save),
+                          label: Text(isUpdatingMistSettings ? 'Applying...' : 'Apply Settings'),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.blue[700],
+                            foregroundColor: Colors.white,
+                            padding: EdgeInsets.symmetric(vertical: 12),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                          ),
+                        ),
+                      ),
                     ],
                   ),
                 ),
